@@ -2560,10 +2560,11 @@ function simulateNoTransientDup(
   simulateNoTransientDup(mp.steps)
 }
 
-// 23j) 临时地址必须排除全部目标地址：环内设备原网段虽有空闲，但空闲地址恰是其他设备目标 -> 取其后
+// 23j) 临时地址必须排除全部目标地址：环内设备原网段虽有空闲，但空闲地址恰是其他设备目标 -> 取其后；
+//  且首环结束后临时地址释放，后续环可复用同一地址（逐环完成、不跨环预留）。
 {
   // /29 .1~.6；环 A@.1→.2、B@.2→.1；另有设备 C 的目标恰为 .3（从 .4 迁入），D 目标 .4（从 .3 迁入）形成第二环。
-  // 两环互相占用：第一环的临时候选不得取 .3/.4（第二环目标/占用），应为 .5
+  // 两环互相占用：环 1 的临时候选不得取 .3/.4（第二环目标），应为 .5；环 1 结束后 .5 释放，环 2 复用 .5。
   const p29 = plan({
     parentCidr: '10.8.0.0/29',
     reservations: [],
@@ -2585,10 +2586,14 @@ function simulateNoTransientDup(
   const mp = buildMigrationPlan(importOrThrow(csv, existing, p29), existing, p29)
   check('两个互不相连的互换环都可解（各 3 步，共 6 步）', mp.ok && mp.counts.cycles === 2 && mp.steps.length === 6,
     mp.ok ? mp.steps.map((s) => s.kind).join(',') : mp.blockers.map((x) => x.message).join('|'))
-  const temps = mp.steps.filter((s) => s.kind === 'temp-move').map((s) => intToIp(s.address)).sort()
-  check('两个临时地址为排除占用+全部目标后的 .5 与 .6', JSON.stringify(temps) === JSON.stringify(['10.8.0.5', '10.8.0.6']), JSON.stringify(temps))
+  const temps = mp.steps.filter((s) => s.kind === 'temp-move').map((s) => intToIp(s.address))
+  check('环 1 候选排除全部目标（不取 .3/.4）取 .5；环 2 在环 1 释放后复用 .5', JSON.stringify(temps) === JSON.stringify(['10.8.0.5', '10.8.0.5']), JSON.stringify(temps))
+  check('步骤按环连续：先做完环 1 再做环 2（各 3 步）',
+    mp.steps.map((s) => `${s.deviceId}:${s.kind}`).join(',') ===
+      'a:temp-move,b:move,a:cycle-complete,c:temp-move,d:move,c:cycle-complete',
+    mp.steps.map((s) => `${s.deviceId}:${s.kind}`).join(','))
   const final = simulateNoTransientDup(mp.steps)
-  check('两环结束后最终占用正确且临时地址已释放',
+  check('两环结束后最终占用正确且复用的临时地址已释放',
     (final.get(ipToInt('10.8.0.1')) ?? []).join() === 'b' &&
       (final.get(ipToInt('10.8.0.2')) ?? []).join() === 'a' &&
       (final.get(ipToInt('10.8.0.3')) ?? []).join() === 'd' &&
@@ -2596,6 +2601,97 @@ function simulateNoTransientDup(
       (final.get(ipToInt('10.8.0.5')) ?? []).length === 0 &&
       (final.get(ipToInt('10.8.0.6')) ?? []).length === 0,
   )
+}
+
+// 23j2) 多个独立地址环复用同一临时地址（修复回归）：/29 中设备占 .1~.5，唯一空闲 .6；
+//  CSV 让 .1/.2、.3/.4 分别互换、.5 不动。旧实现把 .6 永久预留给首环而拒绝整份清单；
+//  新实现逐环完成（按环内最小旧地址升序），首环结束释放 .6，次环复用 .6。
+{
+  const p10_29 = plan({
+    parentCidr: '192.168.10.0/29',
+    reservations: [],
+    requirements: [{ id: 's29', name: '小/29段', hosts: 6, cidr: '192.168.10.0/29' }],
+  })
+  check('/29 规划成功（可用 .1~.6）', p10_29.inputErrors.length === 0 && p10_29.segments.some((x) => x.cidr === '192.168.10.0/29'))
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 's29', name: 'A', address: ipToInt('192.168.10.1'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 's29', name: 'B', address: ipToInt('192.168.10.2'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 's29', name: 'C', address: ipToInt('192.168.10.3'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+    { id: 'd', ownerId: 's29', name: 'D', address: ipToInt('192.168.10.4'), mode: 'manual', mac: 'aa:bb:cc:00:00:04' },
+    { id: 'e', ownerId: 's29', name: 'E留守', address: ipToInt('192.168.10.5'), mode: 'manual', mac: 'aa:bb:cc:00:00:05' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.0/29,A,192.168.10.2,aa:bb:cc:00:00:01',
+    '192.168.10.0/29,B,192.168.10.1,aa:bb:cc:00:00:02',
+    '192.168.10.0/29,C,192.168.10.4,aa:bb:cc:00:00:03',
+    '192.168.10.0/29,D,192.168.10.3,aa:bb:cc:00:00:04',
+    '192.168.10.0/29,E留守,192.168.10.5,aa:bb:cc:00:00:05',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing, p10_29), existing, p10_29)
+  check('两个独立互换环 + 唯一空闲 .6：整份清单可解（2 环、6 步），不被首环预留误阻断',
+    mp.ok && mp.counts.cycles === 2 && mp.steps.length === 6,
+    mp.ok ? mp.steps.map((s) => [s.kind, s.deviceId, intToIp(s.fromAddress ?? -1), intToIp(s.address)]).join('|') : mp.blockers.map((x) => x.message).join('|'))
+  // 两个环各 3 步且彼此连续：先完整做完环 1（A/B），再做环 2（C/D）
+  check('顺序按环内最小旧地址升序、逐环完成：A临时→B迁移→A归位，随后 C临时→D迁移→C归位',
+    mp.steps.map((s) => `${s.deviceId}:${s.kind}`).join(',') ===
+      'a:temp-move,b:move,a:cycle-complete,c:temp-move,d:move,c:cycle-complete',
+    mp.steps.map((s) => `${s.deviceId}:${s.kind}`).join(','))
+  const temps = mp.steps.filter((s) => s.kind === 'temp-move').map((s) => intToIp(s.address))
+  check('唯一空闲 .6 被两环先后复用（两次临时迁出都到 .6）',
+    JSON.stringify(temps) === JSON.stringify(['192.168.10.6', '192.168.10.6']), JSON.stringify(temps))
+  check('两个环的临时锚点同为 .6（环摘要如实展示复用）',
+    mp.cycles.length === 2 && mp.cycles.every((c) => c.tempAddress === ipToInt('192.168.10.6') && !c.blocked),
+    JSON.stringify(mp.cycles.map((c) => [c.pivotName, c.tempAddress, c.blocked])))
+  const final2 = simulateNoTransientDup(mp.steps, [
+    { id: 'e', ownerId: 's29', name: 'E留守', address: ipToInt('192.168.10.5'), mode: 'manual' },
+  ])
+  check('逐环结束终态正确：.1=B、.2=A、.3=D、.4=C、.5=E 留守、.6 已释放',
+    (final2.get(ipToInt('192.168.10.1')) ?? []).join() === 'b' &&
+      (final2.get(ipToInt('192.168.10.2')) ?? []).join() === 'a' &&
+      (final2.get(ipToInt('192.168.10.3')) ?? []).join() === 'd' &&
+      (final2.get(ipToInt('192.168.10.4')) ?? []).join() === 'c' &&
+      (final2.get(ipToInt('192.168.10.5')) ?? []).join() === 'e' &&
+      (final2.get(ipToInt('192.168.10.6')) ?? []).length === 0,
+  )
+  check('复制清单如实反映复用顺序（两次 192.168.10.6）',
+    (migrationPlanText(mp).match(/192\.168\.10\.6/g) ?? []).length >= 2)
+}
+
+// 23j3) 真正没有任何临时地址：/29 六个可用地址 .1~.6 全部被占（两台不迁设备守 .5/.6），
+//  .1/.2、.3/.4 分别互换——首环选址当时即无空闲，整份清单阻断、不输出部分步骤。
+{
+  const pFull = plan({
+    parentCidr: '10.7.0.0/29',
+    reservations: [],
+    requirements: [{ id: 'sf', name: '满/29段', hosts: 6, cidr: '10.7.0.0/29' }],
+  })
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'sf', name: 'A', address: ipToInt('10.7.0.1'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'sf', name: 'B', address: ipToInt('10.7.0.2'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 'sf', name: 'C', address: ipToInt('10.7.0.3'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+    { id: 'd', ownerId: 'sf', name: 'D', address: ipToInt('10.7.0.4'), mode: 'manual', mac: 'aa:bb:cc:00:00:04' },
+    { id: 'e', ownerId: 'sf', name: 'E留守', address: ipToInt('10.7.0.5'), mode: 'manual', mac: 'aa:bb:cc:00:00:05' },
+    { id: 'f', ownerId: 'sf', name: 'F留守', address: ipToInt('10.7.0.6'), mode: 'manual', mac: 'aa:bb:cc:00:00:06' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '10.7.0.0/29,A,10.7.0.2,aa:bb:cc:00:00:01',
+    '10.7.0.0/29,B,10.7.0.1,aa:bb:cc:00:00:02',
+    '10.7.0.0/29,C,10.7.0.4,aa:bb:cc:00:00:03',
+    '10.7.0.0/29,D,10.7.0.3,aa:bb:cc:00:00:04',
+    '10.7.0.0/29,E留守,10.7.0.5,aa:bb:cc:00:00:05',
+    '10.7.0.0/29,F留守,10.7.0.6,aa:bb:cc:00:00:06',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing, pFull), existing, pFull)
+  check('全占 /29 两个互换环：首环即无临时地址，整份清单阻断、零步骤',
+    !mp.ok && mp.steps.length === 0 && mp.blockers.some((b) => b.kind === 'no-temp') &&
+      mp.cycles.length === 2 && mp.cycles.every((c) => c.blocked),
+    JSON.stringify({ ok: mp.ok, steps: mp.steps.length, blockers: mp.blockers.map((b) => b.message), cycles: mp.cycles.map((c) => c.blocked) }))
+  check('阻断原因给出原网段可用范围 .1 ~ .6',
+    mp.blockers.some((b) => /10\.7\.0\.1 ~ 10\.7\.0\.6/.test(b.message)),
+    mp.blockers.map((b) => b.message).join('|'))
+  check('阻断时复制文本为空', migrationPlanText(mp) === '')
 }
 
 // 23k) 冲突预览 / 不可应用时不产生结果

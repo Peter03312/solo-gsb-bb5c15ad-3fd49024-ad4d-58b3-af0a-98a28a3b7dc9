@@ -122,9 +122,10 @@ export default function MigrationPanel({
       <p className="subtitle" style={{ marginBottom: 10 }}>
         复用上方<strong>现有主机登记</strong>与<strong>无冲突的 CSV 合并预览</strong>，以旧地址占用关系建立依赖图，
         生成按序执行时<strong>不会产生瞬时重复 IPv4</strong> 的逐步改址清单。无环依赖按可执行顺序输出；
-        <strong>互换或多设备环路</strong>先把环中一台设备迁到其<strong>原网段内最低的临时可用地址</strong>
-        （已排除当前占用与全部目标地址），再依次完成环路并释放临时地址；找不到临时地址时
-        <strong>明确阻止该环</strong>。本模块<strong>只读、不改动登记</strong>；CSV 存在冲突时不产生结果。
+        多个<strong>互换或多设备环路</strong>按环内最小旧地址升序<strong>逐环</strong>处理——每环先把一台设备迁到其
+        <strong>原网段内选址当时最低的临时可用地址</strong>（避开当时占用与全部最终目标），环内改址、锚点归位后
+        <strong>临时地址立即释放、供后续独立环复用</strong>；只有选址当时确实没有任何临时地址（或目标被不会迁走的设备占住）时，
+        才<strong>阻断整份清单且不输出任何部分步骤</strong>。本模块<strong>只读、不改动登记</strong>；CSV 存在冲突时不产生结果。
       </p>
 
       {planPaused && (
@@ -205,6 +206,7 @@ export default function MigrationPanel({
               <ul className="migration-cycle-list">
                 {plan.cycles.map((c, i) => (
                   <li key={i} className={c.blocked ? 'is-blocked' : ''}>
+                    环 {i + 1}（按环内最小旧地址升序）：
                     {c.deviceNames.map((n) => `“${n}”`).join(' → ')} → 回到起点：
                     {c.blocked ? (
                       <span className="lease-blocked-hint">
@@ -216,6 +218,7 @@ export default function MigrationPanel({
                         {' '}以设备<strong>“{c.pivotName}”</strong>为临时锚点，先迁至原网段{' '}
                         <code className="mono">{c.tempCidr}</code> 的临时地址{' '}
                         <code className="mono migration-temp-ip">{intToIp(c.tempAddress!)}</code>
+                        ，环内改址完成后锚点归位、该临时地址释放（可被后续环复用）
                       </>
                     )}
                   </li>
