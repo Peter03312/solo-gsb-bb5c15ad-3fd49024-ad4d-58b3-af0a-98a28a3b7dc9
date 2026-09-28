@@ -122,9 +122,9 @@ export default function MigrationPanel({
       <p className="subtitle" style={{ marginBottom: 10 }}>
         复用上方<strong>现有主机登记</strong>与<strong>无冲突的 CSV 合并预览</strong>，以旧地址占用关系建立依赖图，
         生成按序执行时<strong>不会产生瞬时重复 IPv4</strong> 的逐步改址清单。无环依赖按可执行顺序输出；
-        <strong>互换或多设备环路</strong>先把环中一台设备迁到其<strong>原网段内最低的临时可用地址</strong>
-        （已排除当前占用与全部目标地址），再依次完成环路并释放临时地址；找不到临时地址时
-        <strong>明确阻止该环</strong>。本模块<strong>只读、不改动登记</strong>；CSV 存在冲突时不产生结果。
+        <strong>互换或多设备环路</strong>按环内最小旧地址升序<strong>逐环</strong>处理：先把环中一台设备迁到其<strong>原网段内当时最低的临时可用地址</strong>
+        （避开当时占用与全部最终目标地址），再依次完成环内改址并让锚点归位、<strong>立即释放临时地址，后续环可复用同一临时地址</strong>；
+        真正找不到临时地址时<strong>阻断整份清单且不输出部分步骤</strong>。本模块<strong>只读、不改动登记</strong>；CSV 存在冲突时不产生结果。
       </p>
 
       {planPaused && (

@@ -6,11 +6,14 @@
 //   2. 模块纯只读：不修改规划与任何登记状态，CSV / 规划 / 登记变化后由调用方重新执行即可实时重算；
 //   3. 以「旧地址占用关系」建立依赖：设备 X 的目标地址当前由设备 Y 占用，则 X 依赖 Y 先迁出；
 //      无环（DAG）部分按「目标地址最低优先」的可执行顺序逐步输出；
-//   4. 互换或多设备环路（依赖图中的环）先把环中一台设备迁到其【原网段】内最低的临时可用地址
-//      （候选须排除全部当前占用与全部目标地址，亦排除此前为其他环路选定的临时地址），
-//      再依次完成环路，最后把该设备从临时地址迁到目标地址并自然释放临时地址；
-//      环中没有任何一台设备能在其原网段找到临时地址时，明确阻止该环（并阻止整个清单）；
-//   5. 新建设备（CSV 中的新 MAC）在其目标地址腾空后才能上线；目标地址被不会迁走的
+//   4. 互换或多设备环路（依赖图中的强连通分量）按【环内最小旧地址升序】逐环处理：每个环先把环中
+//      一台设备迁到其【原网段】内当时最低的临时可用地址（候选须避开该时刻的全部占用与全部最终目标
+//      地址），再按环内目标地址升序完成环内改址，最后让锚点从临时地址归位并立即释放临时地址；
+//      临时地址不跨环预留——前一个环完成后其临时地址即回到空闲池，允许后续环复用同一个临时地址；
+//   5. 执行模拟逐环连续推进（一个环的临时迁出、环内改址、锚点归位三步连续完成后再进入下一环节），
+//      每一步都断言迁入地址当时无其他设备，全程无瞬时重复 IPv4；真正没有临时地址、或目标地址被
+//      不会迁走的设备占用时阻断整份清单，已模拟出的部分步骤也一律不输出。
+//   6. 新建设备（CSV 中的新 MAC）在其目标地址腾空后才能上线；目标地址被不会迁走的
 //      既有设备占住时，作为阻断项明确列出。
 
 import { intToIp } from './ip'
@@ -247,109 +250,66 @@ export function buildMigrationPlan(
   /* ---------- 强连通分量（Tarjan，迭代式，仅改址设备参与） ---------- */
   const cycles = findCycles(movers, deps)
 
-  /* ---------- 为每个环选取临时锚点与临时地址 ---------- */
-  // 已被此前环路占用的临时地址：同样避让，保证各环步骤之间也不会瞬时撞址
-  const usedTempAddresses = new Set<number>()
-  const cycleViews: MigrationCycle[] = []
-  // pivot -> { temp, tempSeg }
-  const tempPlan = new Map<string, { temp: number; tempSeg: AllocSegment }>()
-
-  // 环的展示顺序：按环中最小旧地址升序，保证确定性
-  const cycleOrder = cycles
+  /* ---------- 环的描述与顺序：按环内最小旧地址升序逐环处理 ---------- */
+  interface CycleRun {
+    memberIds: string[]
+    members: DeviceView[]
+    names: string[]
+    minFrom: number
+    view: MigrationCycle
+  }
+  const cycleRuns: CycleRun[] = cycles
     .map((memberIds) => {
       const byId = new Map(movers.map((d) => [d.id, d]))
-      const views = memberIds.map((id) => byId.get(id)!)
-      const minFrom = Math.min(...views.map((d) => d.from!))
-      return { memberIds, views, minFrom }
+      const members = memberIds.map((id) => byId.get(id)!)
+      const minFrom = Math.min(...members.map((d) => d.from!))
+      const names = members.map((d) => d.name)
+      return {
+        memberIds,
+        members,
+        names,
+        minFrom,
+        view: { deviceIds: memberIds, deviceNames: names, blocked: false },
+      }
     })
     .sort((a, b) => a.minFrom - b.minFrom)
 
-  for (const { memberIds, views } of cycleOrder) {
-    const names = views.map((d) => d.name)
-    // 锚点候选：环中「原网段」可用（旧地址在某网段可用范围内）的设备，
-    // 按原地址升序、再按 ID 稳定排序
-    const candidates = views
-      .filter((d) => d.fromSegment)
-      .sort((a, b) => (a.from! - b.from! || a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  // 设备 -> 所属环序号（仅环内设备）
+  const cycleIndexOfDevice = new Map<string, number>()
+  cycleRuns.forEach((c, i) => {
+    for (const id of c.memberIds) cycleIndexOfDevice.set(id, i)
+  })
 
-    let chosen: { device: DeviceView; temp: number; tempSeg: AllocSegment } | null = null
-    const triedReasons: string[] = []
-    for (const device of candidates) {
-      const seg = device.fromSegment!
-      const forbidden = new Set<number>([...allTargets, ...usedTempAddresses])
-      // 该网段内全部当前占用都排除（环内设备、其他设备一视同仁）
-      for (const addr of occupants.keys()) {
-        if (addr > seg.start && addr < seg.end) forbidden.add(addr)
-      }
-      let found: number | null = null
-      for (let addr = seg.start + 1; addr < seg.end; addr++) {
-        if (!forbidden.has(addr)) {
-          found = addr >>> 0
-          break
-        }
-      }
-      if (found !== null) {
-        chosen = { device, temp: found, tempSeg: seg }
-        break
-      }
-      triedReasons.push(
-        `设备“${device.name}”的原网段 ${seg.cidr}（可用 ${seg.firstUsable} ~ ${seg.lastUsable}）内没有可排除全部当前占用与目标地址后的空闲地址`,
-      )
-    }
-
-    if (!chosen) {
-      const noValidSeg = views.filter((d) => !d.fromSegment)
-      const detail =
-        candidates.length === 0
-          ? `环中设备都无法在其原网段内安排临时地址：${noValidSeg
-              .map((d) => `“${d.name}”（${d.fromInvalidReason ?? '原网段不可用'}）`)
-              .join('；')}`
-          : triedReasons.join('；')
-      const message =
-        `地址依赖环（${names.map((n) => `“${n}”`).join(' → ')} 形成闭环）无法打破：${detail}。` +
-        `已阻止该环，请先释放原网段内的一个可用主机地址（或调整 CSV 目标地址）后重试。`
-      blockers.push({ kind: 'no-temp', devices: names, message })
-      cycleViews.push({
-        deviceIds: memberIds,
-        deviceNames: names,
-        blocked: true,
-        blockReason: detail,
-      })
-      continue
-    }
-
-    usedTempAddresses.add(chosen.temp)
-    tempPlan.set(chosen.device.id, { temp: chosen.temp, tempSeg: chosen.tempSeg })
-    cycleViews.push({
-      deviceIds: memberIds,
-      deviceNames: names,
-      pivotId: chosen.device.id,
-      pivotName: chosen.device.name,
-      tempAddress: chosen.temp,
-      tempCidr: chosen.tempSeg.cidr,
-      blocked: false,
-    })
-  }
-
-  // 存在任何阻断项：不输出步骤（冲突预览式语义——不产生结果、不改动登记）
+  // 目标地址被不会迁走的既有设备占住属硬性阻断：无需模拟即终止，不输出任何步骤
   if (blockers.length > 0) {
     return {
       ok: false,
       steps: [],
       blockers,
-      cycles: cycleViews,
+      cycles: [],
       counts: { moves: movers.length, adds: adds.length, cycles: cycles.length, tempMoves: 0 },
       changedDevices: movers.length + adds.length,
     }
   }
 
-  /* ---------- 模拟执行，保证每一步都不会产生瞬时重复 IPv4 ---------- */
+  /* ---------- 逐步模拟执行 ----------
+     始终维护「当前在线地址 -> 设备」集合，每一步迁入前断言目标地址无其他设备。
+     环按最小旧地址升序【逐环连续完成】：临时迁出 → 环内改址（目标最低优先）→ 锚点归位释放，
+     前一个环彻底结束（临时地址已释放）后才打开下一个环，故同一临时地址可被后续环复用。
+     打开下一个环之前若还有可先行的无环迁移，则先做无环迁移（目标最低优先），为环扫清外部占用。 */
   const steps: MigrationStep[] = []
   const occupied = new Map<number, Set<string>>(
     [...occupants.entries()].map(([addr, set]) => [addr, new Set(set)]),
   )
   const pending = new Map<string, DeviceView>()
   for (const d of movers) pending.set(d.id, d)
+
+  // 当前正在执行的环：锚点临时迁出后置位，锚点归位、环内全部完成后清除
+  let activeCycle = -1
+  // 当前活动环的锚点与临时地址（打开环时才选取——临时候选基于当时占用）
+  let activePivot: { device: DeviceView; temp: number; tempSeg: AllocSegment } | null = null
+  let finishedCycles = 0
+  let aborted: MigrationBlocker | null = null
 
   function removeOccupant(addr: number, id: string) {
     const set = occupied.get(addr)
@@ -370,64 +330,179 @@ export function buildMigrationPlan(
     for (const id of set) if (id !== d.id) return false
     return true
   }
+  function readyDevices(list: DeviceView[]): DeviceView[] {
+    return list
+      .filter((d) => pending.has(d.id) && targetFree(d))
+      .sort((a, b) => a.target - b.target || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  }
+  /** 环的外部前置是否已扫清：环内所有设备的目标地址上只剩环内自身的占用（或空闲）。
+   *  环内互相占用会在锚点腾空后链式解开；这里只检查【环外】是否还压着未迁走的设备。 */
+  function cycleExternallyClear(cycle: CycleRun): boolean {
+    const memberSet = new Set(cycle.memberIds)
+    for (const d of cycle.members) {
+      const set = occupied.get(d.target)
+      if (!set) continue
+      for (const id of set) {
+        if (id !== d.id && !memberSet.has(id)) return false
+      }
+    }
+    return true
+  }
+  /** 在锚点原网段内选当时最低的临时可用主机地址：避开网络 / 广播地址、
+   *  避开该时刻的全部在线占用、避开全部最终目标地址。不跨环预留——已完成环的临时地址可再次入选。 */
+  function chooseTemp(cycle: CycleRun): { device: DeviceView; temp: number; tempSeg: AllocSegment } | null {
+    const candidates = cycle.members
+      .filter((d) => d.fromSegment)
+      .sort((a, b) => a.from! - b.from! || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    for (const device of candidates) {
+      const seg = device.fromSegment!
+      const forbidden = new Set<number>(allTargets)
+      for (const [addr, set] of occupied) {
+        if (set.size > 0 && addr > seg.start && addr < seg.end) forbidden.add(addr)
+      }
+      for (let addr = seg.start + 1; addr < seg.end; addr++) {
+        if (!forbidden.has(addr)) return { device, temp: addr >>> 0, tempSeg: seg }
+      }
+    }
+    return null
+  }
+  function noTempBlocker(cycle: CycleRun): MigrationBlocker {
+    const noValidSeg = cycle.members.filter((d) => !d.fromSegment)
+    const candidates = cycle.members
+      .filter((d) => d.fromSegment)
+      .sort((a, b) => a.from! - b.from! || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    const detail =
+      candidates.length === 0
+        ? `环中设备都无法在其原网段内安排临时地址：${noValidSeg
+            .map((d) => `“${d.name}”（${d.fromInvalidReason ?? '原网段不可用'}）`)
+            .join('；')}`
+        : candidates
+            .map(
+              (d) =>
+                `设备“${d.name}”的原网段 ${d.fromSegment!.cidr}（可用 ${d.fromSegment!.firstUsable} ~ ${
+                  d.fromSegment!.lastUsable
+                }）内没有避开当时占用与全部最终目标地址后的空闲地址`,
+            )
+            .join('；')
+    return {
+      kind: 'no-temp',
+      devices: cycle.names,
+      message:
+        `地址依赖环（${cycle.names.map((n) => `“${n}”`).join(' → ')} 形成闭环）无法打破：${detail}。` +
+        `已阻止整份迁移清单，请先释放原网段内的一个可用主机地址（或调整 CSV 目标地址）后重试。`,
+    }
+  }
 
   let order = 1
 
-  // 第 1 阶段：全部环锚点临时迁出（先在占用表中腾空其原地址）
-  for (const cycle of cycleViews) {
-    const pivotId = cycle.pivotId!
-    const device = pending.get(pivotId)!
-    const { temp, tempSeg } = tempPlan.get(pivotId)!
-    removeOccupant(device.from!, device.id)
-    addOccupant(temp, device.id)
-    steps.push({
-      order: order++,
-      kind: 'temp-move',
-      deviceId: device.id,
-      name: device.name,
-      fromAddress: device.from,
-      address: temp,
-      tempAddress: temp,
-      targetCidr: device.targetCidr,
-      tempCidr: tempSeg.cidr,
-      reason: `设备“${device.name}”处于地址依赖环（${cycle.deviceNames.map((n) => `“${n}”`).join(' → ')}）中，先迁到原网段 ${tempSeg.cidr} 内最低的临时可用地址 ${intToIp(temp)}（已排除全部当前占用与目标地址），为环路腾空 ${intToIp(device.from!)}`,
-    })
-  }
-
-  // 第 2 阶段：反复取目标地址最低、且目标已腾空的设备执行迁移，直至无环依赖全部完成、
-  // 环内剩余设备也在锚点腾空后链式可执行
-  while (pending.size > 0) {
-    const ready = [...pending.values()].filter(targetFree).sort((a, b) =>
-      a.target - b.target || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
-    )
-    if (ready.length === 0) {
-      // 理论上不可达：所有环都已通过临时锚点打破；防御性阻断
-      blockers.push({
-        kind: 'no-temp',
-        devices: [...pending.values()].map((d) => d.name),
-        message: '仍存在无法排序的地址依赖环，迁移编排已中止。',
-      })
-      break
+  while (pending.size > 0 && !aborted) {
+    if (activeCycle >= 0) {
+      /* ---- 活动环：连续完成环内改址与锚点归位，中途不穿插其他设备 ---- */
+      const cycle = cycleRuns[activeCycle]
+      const ready = readyDevices(cycle.members)
+      if (ready.length === 0) {
+        // 理论上不可达：打开环时已确认外部扫清，锚点腾空后环内必链式可执行；防御性阻断
+        aborted = {
+          kind: 'no-temp',
+          devices: cycle.names,
+          message: '环内迁移出现无法排序的依赖，迁移编排已中止。',
+        }
+        break
+      }
+      const d = ready[0]
+      const isPivot = activePivot!.device.id === d.id
+      const fromAddr = isPivot ? activePivot!.temp : d.from!
+      removeOccupant(fromAddr, d.id)
+      addOccupant(d.target, d.id)
+      pending.delete(d.id)
+      if (isPivot) {
+        const { temp, tempSeg } = activePivot!
+        steps.push({
+          order: order++,
+          kind: 'cycle-complete',
+          deviceId: d.id,
+          name: d.name,
+          fromAddress: temp,
+          address: d.target,
+          tempAddress: temp,
+          targetCidr: d.targetCidr,
+          tempCidr: tempSeg.cidr,
+          reason: `环路已腾空：设备“${d.name}”从临时地址 ${intToIp(temp)} 迁到目标地址 ${intToIp(d.target)}（${d.targetCidr}），临时地址同步释放，本环完成；释放出的临时地址可被后续环复用`,
+        })
+      } else {
+        const depNames = depNamesOf(d)
+        steps.push({
+          order: order++,
+          kind: 'move',
+          deviceId: d.id,
+          name: d.name,
+          fromAddress: d.from,
+          address: d.target,
+          targetCidr: d.targetCidr,
+          reason:
+            depNames.length > 0
+              ? `目标地址 ${intToIp(d.target)} 的原占用设备 ${depNames.map((n) => `“${n}”`).join('、')} 已迁出，现可改址（${intToIp(d.from!)} → ${intToIp(d.target)}）`
+              : `目标地址 ${intToIp(d.target)} 当前空闲，可直接改址（${intToIp(d.from!)} → ${intToIp(d.target)}），不产生瞬时重复`,
+        })
+      }
+      if (!cycle.members.some((m) => pending.has(m.id))) {
+        // 本环全部完成：锚点信息复位，临时地址此刻已无任何设备占用
+        activePivot = null
+        activeCycle = -1
+        finishedCycles++
+      }
+      continue
     }
-    const d = ready[0]
-    const isPivot = tempPlan.has(d.id)
-    removeOccupant(currentAddressOf(d), d.id)
-    addOccupant(d.target, d.id)
-    pending.delete(d.id)
-    if (isPivot) {
-      const { temp } = tempPlan.get(d.id)!
+
+    /* ---- 无活动环：优先保证按最小旧地址升序打开下一个未完成的环 ---- */
+    const nextCycleIdx = cycleRuns.findIndex((_, i) => i >= finishedCycles && cycleRuns[i].members.some((m) => pending.has(m.id)))
+    const nextCycle = nextCycleIdx >= 0 ? cycleRuns[nextCycleIdx] : null
+
+    if (nextCycle && cycleExternallyClear(nextCycle)) {
+      // 打开该环：此刻才在锚点原网段内选最低临时可用地址（前序环的临时地址已释放，可被复用）
+      const chosen = chooseTemp(nextCycle)
+      if (!chosen) {
+        aborted = noTempBlocker(nextCycle)
+        nextCycle.view.blocked = true
+        nextCycle.view.blockReason = aborted.message
+        // 后续环标记为随整份清单一并阻止（不输出任何步骤）
+        for (let i = nextCycleIdx + 1; i < cycleRuns.length; i++) {
+          cycleRuns[i].view.blocked = true
+          cycleRuns[i].view.blockReason = '前序环无法打破，整份清单已阻止，本环未执行'
+        }
+        break
+      }
+      const { device, temp, tempSeg } = chosen
+      removeOccupant(device.from!, device.id)
+      addOccupant(temp, device.id)
+      activeCycle = nextCycleIdx
+      activePivot = { device, temp, tempSeg }
+      nextCycle.view.pivotId = device.id
+      nextCycle.view.pivotName = device.name
+      nextCycle.view.tempAddress = temp
+      nextCycle.view.tempCidr = tempSeg.cidr
       steps.push({
         order: order++,
-        kind: 'cycle-complete',
-        deviceId: d.id,
-        name: d.name,
-        fromAddress: temp,
-        address: d.target,
+        kind: 'temp-move',
+        deviceId: device.id,
+        name: device.name,
+        fromAddress: device.from,
+        address: temp,
         tempAddress: temp,
-        targetCidr: d.targetCidr,
-        reason: `环路已腾空：设备“${d.name}”从临时地址 ${intToIp(temp)} 迁到目标地址 ${intToIp(d.target)}（${d.targetCidr}），临时地址同步释放，环路完成`,
+        targetCidr: device.targetCidr,
+        tempCidr: tempSeg.cidr,
+        reason: `设备“${device.name}”处于地址依赖环（${nextCycle.names.map((n) => `“${n}”`).join(' → ')}）中，先迁到原网段 ${tempSeg.cidr} 内当时最低的临时可用地址 ${intToIp(temp)}（已避开当时全部占用与全部最终目标地址），为环路腾空 ${intToIp(device.from!)}；本环完成后该临时地址立即释放，可被后续环复用`,
       })
-    } else {
+      continue
+    }
+
+    /* ---- 下一个环尚有外部占用：先执行目标地址最低、且目标已腾空的无环迁移为其扫清 ---- */
+    const nonCycleReady = readyDevices([...pending.values()].filter((d) => !cycleIndexOfDevice.has(d.id)))
+    if (nonCycleReady.length > 0) {
+      const d = nonCycleReady[0]
+      removeOccupant(d.from!, d.id)
+      addOccupant(d.target, d.id)
+      pending.delete(d.id)
       const depNames = depNamesOf(d)
       steps.push({
         order: order++,
@@ -442,10 +517,34 @@ export function buildMigrationPlan(
             ? `目标地址 ${intToIp(d.target)} 的原占用设备 ${depNames.map((n) => `“${n}”`).join('、')} 已迁出，现可改址（${intToIp(d.from!)} → ${intToIp(d.target)}）`
             : `目标地址 ${intToIp(d.target)} 当前空闲，可直接改址（${intToIp(d.from!)} → ${intToIp(d.target)}），不产生瞬时重复`,
       })
+      continue
+    }
+
+    // 理论上不可达：硬性 occupied 阻断已在模拟前拦截，所有环都可通过临时锚点打破
+    aborted = {
+      kind: 'no-temp',
+      devices: [...pending.values()].map((d) => d.name),
+      message: '仍存在无法排序的地址依赖环，迁移编排已中止。',
+    }
+    break
+  }
+
+  // 任何阻断（含模拟中途发现无临时地址）：不输出部分步骤，整份清单作废
+  if (aborted) {
+    blockers.push(aborted)
+  }
+  if (blockers.length > 0) {
+    return {
+      ok: false,
+      steps: [],
+      blockers,
+      cycles: cycleRuns.map((c) => c.view),
+      counts: { moves: movers.length, adds: adds.length, cycles: cycles.length, tempMoves: 0 },
+      changedDevices: movers.length + adds.length,
     }
   }
 
-  // 第 3 阶段：新建设备上线（目标地址此时必然已腾空，否则前面已作为阻断项拦截）
+  /* ---------- 新建设备上线（全部改址完成后；目标地址此时必然已腾空） ---------- */
   for (const d of adds.sort((a, b) => a.target - b.target || (a.id < b.id ? -1 : 1))) {
     addOccupant(d.target, d.id)
     steps.push({
@@ -459,36 +558,20 @@ export function buildMigrationPlan(
     })
   }
 
-  if (blockers.length > 0) {
-    return {
-      ok: false,
-      steps: [],
-      blockers,
-      cycles: cycleViews,
-      counts: { moves: movers.length, adds: adds.length, cycles: cycles.length, tempMoves: tempPlan.size },
-      changedDevices: movers.length + adds.length,
-    }
-  }
-
   return {
     ok: true,
     steps,
     blockers: [],
-    cycles: cycleViews,
+    cycles: cycleRuns.map((c) => c.view),
     counts: {
       moves: movers.length,
       adds: adds.length,
       cycles: cycles.length,
-      tempMoves: tempPlan.size,
+      tempMoves: steps.filter((s) => s.kind === 'temp-move').length,
     },
     changedDevices: movers.length + adds.length,
   }
 
-  /* --- 闭包工具：依赖于模拟执行中的占用状态，需在 occupied/pending 声明后使用 --- */
-  function currentAddressOf(d: DeviceView): number {
-    if (tempPlan.has(d.id)) return tempPlan.get(d.id)!.temp
-    return d.from!
-  }
   function depNamesOf(d: DeviceView): string[] {
     return [...(deps.get(d.id) ?? [])]
       .map((id) => existingById.get(id)?.name ?? '未命名设备')
